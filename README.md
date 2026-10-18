@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 
 # Food Bridge — Food Waste Management System
 
@@ -129,3 +130,6 @@ Refer to `/docs` for request fields, response formats, and available endpoints.
 ## Project Status
 
 Backend development and initial API testing are complete. Frontend integration and further testing can be carried out next.
+=======
+# Food_Bridge
+>>>>>>> ec1f7ab9689b92d223998d00fd2126a8fd79c130
