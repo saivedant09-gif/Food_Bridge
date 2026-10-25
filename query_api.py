@@ -2,8 +2,11 @@
 from fastapi import APIRouter, HTTPException, Query
 from database import get_connection
 from mongodb import client
+from database_diagnostics import diagnose
+import logging
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def read_rows(sql, params=()):
@@ -15,7 +18,7 @@ def read_rows(sql, params=()):
         cursor.execute(sql, params)
         return cursor.fetchall()
     except Exception as error:
-        raise HTTPException(503, 'Database unavailable. Check your local MySQL service.') from error
+        raise HTTPException(503, 'Database unavailable. Check the configured MySQL service.') from error
     finally:
         if cursor is not None:
             cursor.close()
@@ -55,16 +58,21 @@ def list_requests(donor_id: int | None = Query(default=None, gt=0), ngo_id: int 
 @router.get('/health')
 def health():
     databases = {}
+    errors = {}
     try:
         read_rows('SELECT 1 AS connected')
         databases['mysql'] = 'connected'
-    except HTTPException:
+    except HTTPException as error:
         databases['mysql'] = 'unavailable'
+        errors['mysql'] = diagnose('mysql', error.__cause__ or error)
     try:
         client.admin.command('ping')
         databases['mongodb'] = 'connected'
-    except Exception:
+    except Exception as error:
         databases['mongodb'] = 'unavailable'
+        errors['mongodb'] = diagnose('mongodb', error)
     if 'unavailable' in databases.values():
-        raise HTTPException(503, {'status': 'degraded', **databases})
+        for database, error in errors.items():
+            logger.warning('Database health failure: %s (%s)', database, error['code'])
+        raise HTTPException(503, {'status': 'degraded', **databases, 'errors': errors})
     return {'status': 'ready', **databases}
