@@ -1,0 +1,24 @@
+[{
+  "_id": {
+    "$oid": "6ad4913e69751d223cde80b6"
+  },
+  "food_id": 1,
+  "food_name": "Vegetable Rice Meals",
+  "reviewer_ngo": "Helping Hands NGO",
+  "rating": 5,
+  "feedback": "Food was fresh and well packed.",
+  "quantity_received": 25,
+  "review_date": "2026-10-18"
+},
+{
+  "_id": {
+    "$oid": "6ad4942e9728498caebc34d9"
+  },
+  "food_id": 2,
+  "food_name": "Idli and Sambar",
+  "reviewer_ngo": "Food for All Foundation",
+  "rating": 4,
+  "feedback": "Good quality food, delivered on time.",
+  "quantity_received": 20,
+  "review_date": "2026-10-18"
+}]

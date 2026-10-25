@@ -1,12 +1,15 @@
 
 from fastapi import FastAPI, HTTPException
 from database import get_connection
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from datetime import date
 from mongodb import food_reviews
-from pydantic import BaseModel, Field
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal
+import os
+from fastapi.middleware.cors import CORSMiddleware
+from query_api import router as query_router
 
 
 app = FastAPI(
@@ -14,6 +17,16 @@ app = FastAPI(
     description="Food Waste Management and Redistribution System",
     version="1.0"
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in os.getenv(
+        "CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173"
+    ).split(",") if origin.strip()],
+    allow_methods=["GET", "POST", "PUT"],
+    allow_headers=["Content-Type"],
+)
+app.include_router(query_router)
 
 
 @app.get("/")
@@ -36,10 +49,12 @@ def get_food_listings():
         cursor.execute("""
             SELECT
                 f.food_id,
+                f.donor_id,
                 f.food_name,
                 f.quantity,
                 f.available_quantity,
                 f.unit,
+                f.prepared_at,
                 f.pickup_deadline,
                 f.status,
                 u.name AS donor_name,
@@ -66,12 +81,18 @@ def get_food_listings():
             connection.close()
 
 class FoodCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, allow_inf_nan=False)
     donor_id: int = Field(gt=0)
     food_name: str = Field(min_length=2, max_length=150)
-    quantity: float = Field(gt=0, le=1000000)
+    quantity: float = Field(gt=0, le=1000000, multiple_of=0.01)
     unit: str = Field(min_length=1, max_length=30)
     prepared_at: datetime
     pickup_deadline: datetime
+
+    @field_validator('prepared_at', 'pickup_deadline')
+    @classmethod
+    def local_datetime(cls, value):
+        return value.astimezone().replace(tzinfo=None) if value.tzinfo else value
 
 
 @app.post("/food", status_code=201)
@@ -85,6 +106,9 @@ def create_food(food: FoodCreate):
                 status_code=400,
                 detail="Pickup deadline must be after preparation time"
             )
+
+        if food.pickup_deadline <= datetime.now():
+            raise HTTPException(400, 'Pickup deadline must be in the future')
 
         connection = get_connection()
         cursor = connection.cursor(dictionary=True)
@@ -159,9 +183,10 @@ def create_food(food: FoodCreate):
             connection.close()
 
 class DonationRequestCreate(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     food_id: int = Field(gt=0)
     ngo_id: int = Field(gt=0)
-    requested_quantity: float = Field(gt=0, le=1000000)
+    requested_quantity: float = Field(gt=0, le=1000000, multiple_of=0.01)
 
 
 @app.post("/requests", status_code=201)
@@ -188,7 +213,7 @@ def create_donation_request(request: DonationRequestCreate):
         # Check the food listing and its availability
         cursor.execute(
             """
-            SELECT food_id, available_quantity, status
+            SELECT food_id, available_quantity, status, pickup_deadline
             FROM food_listings
             WHERE food_id = %s
             """,
@@ -203,7 +228,7 @@ def create_donation_request(request: DonationRequestCreate):
                 detail="Food listing not found"
             )
 
-        if food["status"] != "AVAILABLE":
+        if food["status"] != "AVAILABLE" or food['pickup_deadline'] <= datetime.now():
             raise HTTPException(
                 status_code=400,
                 detail="Food listing is not available"
@@ -302,7 +327,7 @@ def approve_request(request_id: int):
         # Lock the associated food listing
         cursor.execute(
             """
-            SELECT available_quantity, status
+            SELECT available_quantity, status, pickup_deadline
             FROM food_listings
             WHERE food_id = %s
             FOR UPDATE
@@ -311,14 +336,14 @@ def approve_request(request_id: int):
         )
         food = cursor.fetchone()
 
-        if food is None or food["status"] != "AVAILABLE":
+        if food is None or food["status"] != "AVAILABLE" or food['pickup_deadline'] <= datetime.now():
             raise HTTPException(
                 status_code=400,
                 detail="Food listing is not available"
             )
 
-        requested = float(request["requested_quantity"])
-        available = float(food["available_quantity"])
+        requested = Decimal(str(request["requested_quantity"]))
+        available = Decimal(str(food["available_quantity"]))
 
         if requested > available:
             raise HTTPException(
@@ -440,7 +465,8 @@ def reject_request(request_id: int):
             connection.close()
 
 class CollectionCreate(BaseModel):
-    collected_quantity: float = Field(gt=0, le=1000000)
+    model_config = ConfigDict(str_strip_whitespace=True, allow_inf_nan=False)
+    collected_quantity: float = Field(gt=0, le=1000000, multiple_of=0.01)
     notes: str = Field(default="", max_length=255)
 
 
@@ -484,6 +510,15 @@ def collect_food(request_id: int, data: CollectionCreate):
                 detail="Collected quantity exceeds requested quantity"
             )
 
+        # Keep the stock update in the same transaction as the collection.
+        cursor.execute(
+            'SELECT available_quantity, pickup_deadline, status FROM food_listings WHERE food_id = %s FOR UPDATE',
+            (request['food_id'],)
+        )
+        food = cursor.fetchone()
+        if food is None:
+            raise HTTPException(404, 'Food listing not found')
+
         # Insert the collection record
         cursor.execute(
             """
@@ -508,12 +543,33 @@ def collect_food(request_id: int, data: CollectionCreate):
             (request_id,)
         )
 
+        uncollected = Decimal(str(request['requested_quantity'])) - Decimal(str(data.collected_quantity))
+        remaining = Decimal(str(food['available_quantity'])) + uncollected
+        cursor.execute(
+            "SELECT COUNT(*) AS pending_collections FROM donation_requests WHERE food_id = %s AND status = 'APPROVED'",
+            (request['food_id'],)
+        )
+        pending_collections = cursor.fetchone()['pending_collections']
+        if food['status'] in ('CANCELLED', 'EXPIRED'):
+            food_status = food['status']
+        elif food['pickup_deadline'] <= datetime.now():
+            food_status = 'EXPIRED'
+        elif remaining > 0:
+            food_status = 'AVAILABLE'
+        else:
+            food_status = 'RESERVED' if pending_collections else 'COMPLETED'
+        cursor.execute(
+            'UPDATE food_listings SET available_quantity = %s, status = %s WHERE food_id = %s',
+            (remaining, food_status, request['food_id'])
+        )
+
         connection.commit()
 
         return {
             "message": "Food collection recorded successfully",
             "request_id": request_id,
             "collected_quantity": data.collected_quantity,
+            "released_quantity": uncollected,
             "status": "COMPLETED"
         }
 
@@ -553,15 +609,16 @@ def get_reviews():
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not retrieve reviews: {str(error)}"
+            detail="Could not retrieve reviews. Check the MongoDB connection."
         )
 
 class FoodReviewCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, allow_inf_nan=False)
     food_id: int = Field(gt=0)
-    food_name: str
-    reviewer_ngo: str
+    food_name: str = Field(min_length=2, max_length=150)
+    reviewer_ngo: str = Field(min_length=1, max_length=150)
     rating: int = Field(ge=1, le=5)
-    feedback: str
+    feedback: str = Field(min_length=1, max_length=3000)
     quantity_received: float = Field(gt=0)
     review_date: date
 
@@ -588,7 +645,7 @@ def create_review(review: FoodReviewCreate):
         print("POST /reviews error:", repr(error))
         raise HTTPException(
             status_code=500,
-            detail=f"Could not save review: {str(error)}"
+            detail="Could not save review. Check the MongoDB connection."
         )
 
 
@@ -611,6 +668,6 @@ def get_reviews_by_food(food_id: int):
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not retrieve food reviews: {str(error)}"
+            detail="Could not retrieve food reviews. Check the MongoDB connection."
         )
 

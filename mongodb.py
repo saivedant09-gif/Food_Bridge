@@ -1,11 +1,14 @@
 
 from pymongo import MongoClient
+from dotenv import load_dotenv
+import os
 
-MONGO_URI = "mongodb://localhost:27017"
+load_dotenv()
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017")
 
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 
-db = client["food_bridge_mongo"]
+db = client[os.getenv("MONGO_DATABASE", "food_bridge_mongo")]
 
 food_reviews = db["food_reviews"]
 
